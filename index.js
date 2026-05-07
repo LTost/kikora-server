@@ -28,6 +28,18 @@ app.post("/api/get", (req, res) => {
 	res.json({ answer: db[name] || null });
 });
 
+app.post("/api/delete", (req, res) => {
+	const { name } = req.body;
+	if (!name) return res.status(400).json({ error: "name kreves" });
+	const hadIt = !!db[name];
+	delete db[name];
+	console.log(`[-] Slettet: ${name} (fantes: ${hadIt})`);
+	res.json({ ok: true, deleted: hadIt });
+});
+
+// Se alle lagrede svar (debug)
+app.get("/api/all", (req, res) => res.json(db));
+
 app.get("/", (req, res) => res.json({ status: "ok", entries: Object.keys(db).length }));
 
 app.listen(PORT, () => console.log(`Kikora server kjører på port ${PORT}`));
