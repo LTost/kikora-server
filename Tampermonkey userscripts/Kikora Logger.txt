@@ -1,0 +1,314 @@
+// ==UserScript==
+// @name         Kikora Answer Logger
+// @namespace    http://tampermonkey.net/
+// @version      3.5
+// @description  Logger og deler riktige svar med server – minimal, ingen AI
+// @author       Ludvig
+// @match        https://kikora.no/*
+// @match        https://*.kikora.no/*
+// @match        https://feide.kikora.no/*
+// @grant        GM_xmlhttpRequest
+// @connect      kikora-server-production.up.railway.app
+// ==/UserScript==
+
+(function () {
+	'use strict';
+
+	const HAX_SERVER = 'https://kikora-server-production.up.railway.app';
+
+	let sisteHash       = window.location.hash;
+	let sisteLoggetSvar = '';
+	let serverHarSvar   = false;
+	let klarTilScrape   = true;
+
+	// ===================== OPPGAVE-ID =====================
+	function getOppgaveId() {
+		const hash = window.location.hash;
+		const m = hash.match(/\/(\d{7,})(?:[/?#]|$)/);
+		if (m) return m[1];
+		return hash || window.location.href;
+	}
+
+	// ===================== SERVER =====================
+	function serverLagre(name, svar) {
+		if (!name || !svar) return;
+		setStatus('Lagrer: ' + svar + '...', '#e67e22');
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/place',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name, answer: svar }),
+			anonymous: false,
+			onload: function(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					if (data.ok) {
+						console.log('[Kikora Logger] Lagret:', name, '=>', svar);
+						setStatus('Lagret: ' + svar, '#27ae60');
+						sisteLoggetSvar = svar;
+						serverHarSvar = true;
+					}
+				} catch(e) {}
+			},
+			onerror: function() {
+				console.log('[Kikora Logger] Server utilgjengelig');
+				setStatus('Server utilgjengelig', '#c0392b');
+			},
+		});
+	}
+
+	function serverSlett(name) {
+		setStatus('Sletter...', '#e74c3c');
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/delete',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name }),
+			anonymous: false,
+			onload: function(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					serverHarSvar = false;
+					sisteLoggetSvar = '';
+					setStatus(data.deleted ? 'Slettet!' : 'Ingen svar aa slette', data.deleted ? '#27ae60' : '#888');
+					setResult('');
+				} catch(e) { setStatus('Feil ved sletting', '#e74c3c'); }
+			},
+			onerror: function() { setStatus('Nettverksfeil', '#c0392b'); },
+		});
+	}
+
+	function sjekkOgLogg(id, svar) {
+		if (!svar || svar === sisteLoggetSvar) return;
+		if (serverHarSvar) return;
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/get',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name: id }),
+			anonymous: false,
+			onload: function(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					if (data.answer) {
+						serverHarSvar = true;
+						setStatus('Server har: ' + data.answer, '#16a085');
+						setResult(data.answer);
+					} else {
+						serverLagre(id, svar);
+					}
+				} catch(e) {
+					serverLagre(id, svar);
+				}
+			},
+			onerror: function() { serverLagre(id, svar); },
+		});
+	}
+
+	function serverHentOgVis(id) {
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/get',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name: id }),
+			anonymous: false,
+			onload: function(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					if (data.answer) {
+						serverHarSvar = true;
+						setStatus('Server: ' + data.answer, '#27ae60');
+						setResult(data.answer);
+						console.log('[Kikora Logger] Auto-hentet fra server:', data.answer);
+					} else {
+						setStatus('Klar', '#888');
+					}
+				} catch(e) {}
+			},
+			onerror: function() {},
+		});
+	}
+
+	// ===================== SCRAPE SVAR =====================
+	function erRiktig() {
+		const txt = document.body.innerText;
+		return txt.includes('Det er riktig') || txt.includes('Riktig!') || txt.includes('Korrekt') ||
+			!!document.querySelector(".correct-answer, [class*='correctAnswer'], [class*='isCorrect']");
+	}
+
+	function scrapeSvar() {
+		// Trofé-element – mest pålitelig, har alltid riktig svar med enhet
+		const trophy = document.querySelector(
+			".answer-trophy [data-title], [class*='trophy'] [data-title], [class*='correct-answer'] [data-title]"
+		);
+		if (trophy) {
+			const v = (trophy.dataset.title || trophy.getAttribute('title') || '').trim();
+			if (v) return v;
+		}
+		if (!erRiktig()) return null;
+		// Math-field (synlig eller skjult)
+		for (const mf of document.querySelectorAll('math-field')) {
+			const val = mf.getValue ? mf.getValue() : mf.value;
+			if (val && val.trim()) return val.trim();
+		}
+		// Input – sjekk alle, ikke bare synlige (Kikora skjuler input etter riktig svar)
+		for (const inp of document.querySelectorAll("input[type='text'], input[type='number']")) {
+			if (inp.value && inp.value.trim()) return inp.value.trim();
+		}
+		return null;
+	}
+
+	// ===================== UI =====================
+	function setStatus(txt, color) {
+		const el = document.getElementById('kl-status');
+		if (el) { el.textContent = txt; el.style.color = color || '#888'; }
+	}
+
+	function setResult(txt) {
+		const el = document.getElementById('kl-result');
+		if (!el) return;
+		el.textContent = txt;
+		el.style.display = txt ? 'block' : 'none';
+	}
+
+	const panel = document.createElement('div');
+	panel.id = 'kl-panel';
+	panel.style.cssText = 'position:fixed;bottom:20px;left:20px;width:215px;background:#fff;border:1px solid #ddd;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);font-family:sans-serif;font-size:13px;z-index:99999;overflow:hidden;';
+
+	const header = document.createElement('div');
+	header.id = 'kl-header';
+	header.style.cssText = 'background:#2c3e50;color:white;padding:8px 12px;font-weight:bold;cursor:pointer;display:flex;justify-content:space-between;align-items:center;';
+	header.innerHTML = '<span>Kikora Logger</span><span id="kl-toggle" style="font-size:15px;line-height:1;">-</span>';
+
+	const body = document.createElement('div');
+	body.id = 'kl-body';
+	body.style.padding = '10px';
+
+	function lagKnapp(id, tekst, farge) {
+		const btn = document.createElement('button');
+		btn.id = id;
+		btn.textContent = tekst;
+		btn.style.cssText = 'width:100%;padding:7px;background:' + farge + ';color:white;border:none;border-radius:6px;cursor:pointer;margin-bottom:6px;font-size:12px;';
+		return btn;
+	}
+
+	const getBtn    = lagKnapp('kl-get-btn',    'Hent svar fra server',       '#27ae60');
+	const sendBtn   = lagKnapp('kl-send-btn',   'Send svar til server',       '#e67e22');
+	const deleteBtn = lagKnapp('kl-delete-btn', 'Slett feil svar fra server', '#c0392b');
+
+	const manualRow = document.createElement('div');
+	manualRow.style.cssText = 'display:flex;gap:4px;margin-bottom:8px;';
+	const manualInput = document.createElement('input');
+	manualInput.id = 'kl-manual-input';
+	manualInput.placeholder = 'Manuelt svar...';
+	manualInput.style.cssText = 'flex:1;padding:5px 7px;font-size:12px;border:1px solid #ccc;border-radius:4px;min-width:0;';
+	const manualSend = document.createElement('button');
+	manualSend.id = 'kl-manual-send';
+	manualSend.textContent = 'Send';
+	manualSend.style.cssText = 'padding:5px 8px;background:#8e44ad;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;';
+	manualRow.appendChild(manualInput);
+	manualRow.appendChild(manualSend);
+
+	const statusEl = document.createElement('div');
+	statusEl.id = 'kl-status';
+	statusEl.style.cssText = 'font-size:11px;color:#888;min-height:14px;margin-bottom:4px;word-break:break-word;';
+
+	const resultEl = document.createElement('div');
+	resultEl.id = 'kl-result';
+	resultEl.style.cssText = 'background:#f5f7fa;border-radius:5px;padding:8px;font-size:14px;font-weight:bold;color:#2c3e50;display:none;text-align:center;margin-bottom:4px;';
+
+	const autoTxt = document.createElement('div');
+	autoTxt.style.cssText = 'margin-top:6px;font-size:10px;color:#ccc;text-align:center;';
+	autoTxt.textContent = 'Auto-logger aktiv';
+
+	[getBtn, sendBtn, deleteBtn, manualRow, statusEl, resultEl, autoTxt].forEach(function(el) { body.appendChild(el); });
+	panel.appendChild(header);
+	panel.appendChild(body);
+	document.body.appendChild(panel);
+
+	// ===================== EVENTS =====================
+	let collapsed = false;
+	header.addEventListener('click', function() {
+		collapsed = !collapsed;
+		body.style.display = collapsed ? 'none' : 'block';
+		document.getElementById('kl-toggle').textContent = collapsed ? '+' : '-';
+	});
+
+	getBtn.addEventListener('click', function() {
+		const id = getOppgaveId();
+		setStatus('Henter fra server...', '#3498db');
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/get',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name: id }),
+			anonymous: false,
+			onload: function(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					if (!data.answer) { setStatus('Ingen server-svar for denne oppgaven', '#c0392b'); setResult(''); }
+					else { setStatus('Hentet!', '#27ae60'); setResult(data.answer); serverHarSvar = true; }
+				} catch(e) { setStatus('Parse-feil', '#e74c3c'); }
+			},
+			onerror: function() { setStatus('Nettverksfeil', '#c0392b'); },
+		});
+	});
+
+	sendBtn.addEventListener('click', function() {
+		const svar = scrapeSvar();
+		const id = getOppgaveId();
+		if (!svar) { setStatus('Fant ikke svar paa siden', '#c0392b'); return; }
+		serverLagre(id, svar);
+	});
+
+	deleteBtn.addEventListener('click', function() {
+		serverSlett(getOppgaveId());
+	});
+
+	manualSend.addEventListener('click', function() {
+		const svar = manualInput.value.trim();
+		const id = getOppgaveId();
+		if (!svar) { setStatus('Skriv inn svar forst', '#c0392b'); return; }
+		serverLagre(id, svar);
+	});
+
+	// ===================== AUTO-LOGGER =====================
+	setInterval(function() {
+		if (!klarTilScrape) return;
+		const id = getOppgaveId();
+		if (!id) return;
+		const svar = scrapeSvar();
+		if (!svar) return;
+		sjekkOgLogg(id, svar);
+		setResult(svar);
+	}, 1500);
+
+	// URL-endring: reset, vent, hent fra server automatisk
+	setInterval(function() {
+		const nyHash = window.location.hash;
+		if (nyHash !== sisteHash) {
+			sisteHash = nyHash;
+			sisteLoggetSvar = '';
+			serverHarSvar = false;
+			klarTilScrape = false;
+			setStatus('Ny oppgave', '#3498db');
+			setResult('');
+			console.log('[Kikora Logger] Ny oppgave-ID:', getOppgaveId());
+
+			// Vent til Angular er ferdig, hent svar fra server automatisk
+			setTimeout(function() {
+				klarTilScrape = true;
+				const id = getOppgaveId();
+				if (id) serverHentOgVis(id);
+			}, 2500);
+		}
+	}, 300);
+
+	// Hent svar ved oppstart (for tilfeller der siden allerede er lastet)
+	setTimeout(function() {
+		const id = getOppgaveId();
+		if (id) serverHentOgVis(id);
+	}, 3000);
+
+	console.log('[Kikora Logger] v3.5 klar. Oppgave-ID:', getOppgaveId());
+})();

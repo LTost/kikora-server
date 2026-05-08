@@ -1,0 +1,551 @@
+// ==UserScript==
+// @name         Kikora AI Solver
+// @namespace    http://tampermonkey.net/
+// @version      9.2
+// @description  Løser Kikora automatisk – server, tekst, screenshot, auto-modus
+// @author       LudvigTS
+// @match        https://kikora.no/*
+// @match        https://*.kikora.no/*
+// @match        https://feide.kikora.no/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.groq.com
+// @connect      kikora-server-production.up.railway.app
+// @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
+// ==/UserScript==
+
+(function () {
+	'use strict';
+
+	let API_KEY = GM_getValue('groq_api_key', '');
+	if (!API_KEY) {
+		API_KEY = prompt('Lim inn din Groq API-nøkkel (fra console.groq.com):');
+		if (API_KEY) GM_setValue('groq_api_key', API_KEY.trim());
+	}
+
+	const BASE_URL   = 'https://api.groq.com/openai';
+	const MODEL      = 'meta-llama/llama-4-scout-17b-16e-instruct';
+	const HAX_SERVER = 'https://kikora-server-production.up.railway.app';
+
+	let delaySeconds      = 5;
+	let autoMode          = false;
+	let isRunning         = false;
+	let countdownInterval = null;
+	let forsokSvar        = [];
+	let sisteHash         = window.location.hash;
+
+	// Lokal cache: oppgave-ID => riktig svar (huskes denne sesjonen)
+	const lokalCache = {};
+
+	// ===================== OPPGAVE-ID =====================
+	// URL: #/calculation/t/T548/C173520|C173521|C173530/1103835994
+	function getOppgaveId() {
+		const hash = window.location.hash;
+		const m = hash.match(/\/(\d{7,})(?:[/?#]|$)/);
+		if (m) return m[1];
+		return hash || window.location.href;
+	}
+
+	// ===================== SERVER =====================
+	function serverLagre(svar) {
+		const name = getOppgaveId();
+		if (!name || !svar) return;
+		lokalCache[name] = svar; // lagre i lokal cache også
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/place',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name, answer: svar }),
+			anonymous: false,
+			onload: () => { console.log('[Kikora] Lagret:', name, '=>', svar); setStatus('✓ Lagret: ' + svar, '#27ae60'); },
+			onerror: () => console.log('[Kikora] Server utilgjengelig'),
+		});
+	}
+
+	function serverHent(callback) {
+		const name = getOppgaveId();
+		if (!name) { callback(null); return; }
+
+		// Sjekk lokal cache først (øyeblikkelig)
+		if (lokalCache[name]) { callback(lokalCache[name]); return; }
+
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: HAX_SERVER + '/api/get',
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ name }),
+			anonymous: false,
+			onload(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					const svar = data.answer || null;
+					if (svar) lokalCache[name] = svar; // cache svaret
+					callback(svar);
+				} catch(e) { callback(null); }
+			},
+			onerror: () => callback(null),
+		});
+	}
+
+	// Auto-scrape trofé, lagre i cache og server
+	setInterval(() => {
+		const trophy = document.querySelector(
+			".answer-trophy [data-title], [class*='trophy'] [data-title], [class*='correct-answer'] [data-title]"
+		);
+		if (!trophy) return;
+		const svar = (trophy.dataset.title || trophy.getAttribute('title') || '').trim();
+		if (!svar) return;
+		const id = getOppgaveId();
+		if (lokalCache[id] === svar) return; // allerede lagret
+		serverLagre(svar);
+	}, 1500);
+
+	// Lytt på URL-endring og sjekk lokal cache for ny oppgave
+	setInterval(() => {
+		if (window.location.hash !== sisteHash) {
+			sisteHash = window.location.hash;
+			if (!autoMode) isRunning = false;
+			setStatus('');
+			const result = document.getElementById('ai-result');
+			if (result) { result.textContent = ''; result.style.display = 'none'; }
+
+			// Hvis vi har svaret i cache, vis det automatisk
+			const id = getOppgaveId();
+			if (lokalCache[id]) {
+				setTimeout(() => {
+					setStatus('Cache: ' + lokalCache[id], '#16a085');
+					const r = document.getElementById('ai-result');
+					if (r) { r.textContent = lokalCache[id]; r.style.display = 'block'; }
+				}, 800);
+			}
+		}
+	}, 300);
+
+	// ===================== PROMPTS =====================
+	const PROMPT_TEKST =
+		'Du løser norske matteoppgaver fra Kikora. ' +
+		'Du får oppgavetekst som ren tekst. Ignorer navigasjon og meny-støy. ' +
+		'Tenk grundig internt. Output KUN ett enkelt svar – ingen forklaring, ingen utregning. ' +
+		'Bruk komma som desimaltegn (2,1 ikke 2.1). ' +
+		'Ta MED enhet hvis oppgaven nevner den (cm, m, km, kr, kg, l, %, timer, osv). ' +
+		'Ved målestokk A:B betyr tegning = virkelighet × (A/B). ' +
+		'ALDRI: LaTeX, dollar-tegn, boxed, punktum etter svaret, setninger. ' +
+		'Eksempler: 2 | 1/16 | 2,8 km | 42 kr | 5,0 cm | 150';
+
+	function lagSSPrompt(tidligereSvar) {
+		let p =
+			'Du løser norske matteoppgaver fra Kikora via screenshot. ' +
+			'Ignorer knapper, meny, navigasjon og solver-panelet. ' +
+			'Les oppgaveteksten nøye. Tenk GRUNDIG. ' +
+			'Output KUN ett enkelt svar. Ingen forklaring, ingen LaTeX. ' +
+			'Bruk komma som desimaltegn. Ta med enhet hvis oppgaven nevner den. ' +
+			'Følg svarformat-instruksjoner i bildet hvis det finnes. ' +
+			'Eksempler: 2 | 1/16 | 2,8 km | 42 kr';
+		if (tidligereSvar.length > 0)
+			p += ` VIKTIG: Disse er feil – gi ANNET svar: [${tidligereSvar.join(', ')}].`;
+		return p;
+	}
+
+	// ===================== DOM =====================
+	function setStatus(txt, color = '#888') {
+		const el = document.getElementById('ai-status');
+		if (el) { el.textContent = txt; el.style.color = color; }
+	}
+
+	function hentOppgaveTekst() {
+		const clone = document.body.cloneNode(true);
+		clone.querySelectorAll('script, style, nav, header, footer, #ai-solver-panel').forEach(e => e.remove());
+		return clone.innerText.replace(/\s+/g, ' ').trim().slice(0, 3000);
+	}
+
+	function erRiktig() {
+		const txt = document.body.innerText;
+		if (txt.includes('Det er riktig') || txt.includes('Riktig!') || txt.includes('Korrekt')) return true;
+		if (document.querySelector(".correct-answer, [class*='correctAnswer'], [class*='isCorrect']")) return true;
+		return false;
+	}
+
+	function rensSvar(svar) {
+		if (!svar) return null;
+		svar = svar.split('\n')[0].trim();
+		svar = svar.replace(/\$|\\boxed\{|\}/g, '').trim();
+		svar = svar.replace(/\.$/, '').trim();
+		if (svar.split(' ').length > 5) {
+			const m = svar.match(/([\d]+[,.]?[\d]*\s*(?:cm|m|km|kr|kg|l|%|timer|s|min|g|ml)?)/i);
+			if (m) svar = m[1].trim();
+		}
+		return svar || null;
+	}
+
+	// ===================== FLERVALG =====================
+	function tryKlikkFlervalg(svar) {
+		const norm = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
+		const sn = norm(svar);
+		const selectors = [
+			"input[type='radio']", "input[type='checkbox']",
+			"[class*='option']", "[class*='choice']", "[class*='alternative']",
+			"li[class*='answer']", "button[class*='option']", "[class*='answer-item']"
+		];
+		for (const sel of selectors) {
+			for (const el of document.querySelectorAll(sel)) {
+				const label = el.closest('label') || el.parentElement;
+				const txt = norm(label?.innerText || el.innerText || '');
+				if (txt && (txt === sn || txt.includes(sn) || sn.includes(txt))) {
+					el.click();
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// ===================== SUBMIT =====================
+	function submitSvar(svar, callback) {
+		const mathField = document.querySelector('math-field');
+		if (mathField) {
+			mathField.setValue(svar, { insertionMode: 'replaceAll' });
+			mathField.dispatchEvent(new Event('input', { bubbles: true }));
+			mathField.dispatchEvent(new Event('change', { bubbles: true }));
+		} else {
+			if (!tryKlikkFlervalg(svar)) {
+				setStatus('Fant ikke input-felt.', '#e74c3c');
+				if (callback) callback(false);
+				return;
+			}
+		}
+		setTimeout(() => {
+			for (const el of document.querySelectorAll('button')) {
+				const txt = el.innerText.trim().toLowerCase();
+				if ((txt === 'sjekk' || txt === 'check' || txt === 'submit') &&
+					el.offsetParent !== null && !el.disabled) { el.click(); break; }
+			}
+			setTimeout(() => {
+				const riktig = erRiktig();
+				setStatus(riktig ? '✓ Riktig!' : '✗ Feil – prøver igjen...', riktig ? '#27ae60' : '#e74c3c');
+				if (riktig) serverLagre(svar);
+				if (callback) callback(riktig);
+			}, 1200);
+		}, 500);
+	}
+
+	// ===================== NAVIGASJON =====================
+	function gaTilNeste() {
+		for (const el of document.querySelectorAll('button')) {
+			const txt = el.innerText.trim().toLowerCase();
+			if ((txt === 'fortsett' || txt === 'neste' || txt === 'next' || txt === 'continue') &&
+				el.offsetParent !== null && !el.disabled) { el.click(); return true; }
+		}
+		const arrow = document.querySelector(
+			"[aria-label='Neste'], [aria-label='Next'], button[class*='next']:not([class*='previous']), [class*='navigate-next']"
+		);
+		if (arrow?.offsetParent) { arrow.click(); return true; }
+		return false;
+	}
+
+	function gaTilSisteEtappe() {
+		const dots = Array.from(document.querySelectorAll(
+			"[class*='progress'] button, [class*='step'] button, [class*='dot'], nav button"
+		)).filter(d => d.offsetParent !== null);
+		if (dots.length > 0) { dots[dots.length - 1].click(); return true; }
+		return false;
+	}
+
+	// ===================== COUNTDOWN =====================
+	function startCountdown(sek, onDone) {
+		let igjen = sek;
+		clearInterval(countdownInterval);
+		countdownInterval = setInterval(() => {
+			igjen--;
+			setStatus(`Neste om ${igjen}s...`);
+			if (igjen <= 0) { clearInterval(countdownInterval); onDone(); }
+		}, 1000);
+	}
+
+	// ===================== GROQ =====================
+	function kallGroq(messages, callback) {
+		GM_xmlhttpRequest({
+			method: 'POST',
+			url: `${BASE_URL}/v1/chat/completions`,
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${API_KEY}`,
+				'Accept': 'application/json',
+			},
+			data: JSON.stringify({ model: MODEL, messages, max_tokens: 200 }),
+			anonymous: false,
+			onload(res) {
+				try {
+					const data = JSON.parse(res.responseText);
+					if (data.error) { setStatus('API-feil: ' + data.error.message?.slice(0, 80), '#e74c3c'); callback(null); return; }
+					callback(rensSvar(data.choices[0].message.content.trim()));
+				} catch(e) { setStatus('Parse-feil', '#e74c3c'); callback(null); }
+			},
+			onerror() { setStatus('Nettverksfeil.', '#e74c3c'); callback(null); },
+		});
+	}
+
+	function losMedTekst(callback) {
+		kallGroq([
+			{ role: 'system', content: PROMPT_TEKST },
+			{ role: 'user', content: 'Svar bare med svaret.\n\n' + hentOppgaveTekst() },
+		], callback);
+	}
+
+	function losMedScreenshot(tidligereSvar, callback) {
+		setStatus('Tar screenshot...');
+		panel.style.display = 'none';
+		html2canvas(document.body, { useCORS: true, scale: 1, logging: false }).then(canvas => {
+			panel.style.display = 'block';
+			setStatus('Sender til AI...');
+			const base64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+			const userContent = [
+				{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+				{ type: 'text', text: tidligereSvar.length > 0
+					? `Svar bare med svaret. Disse er FEIL: ${tidligereSvar.join(', ')}. Gi ANNET svar.`
+					: 'Svar bare med svaret.' },
+			];
+			const messages = [{ role: 'system', content: lagSSPrompt(tidligereSvar) }, { role: 'user', content: userContent }];
+			if (tidligereSvar.length > 0) {
+				messages.push({ role: 'assistant', content: tidligereSvar[tidligereSvar.length - 1] });
+				messages.push({ role: 'user', content: `Feil! Ikke ${tidligereSvar.join(', ikke ')}. Gi helt annet svar.` });
+			}
+			kallGroq(messages, callback);
+		}).catch(err => {
+			panel.style.display = 'block';
+			setStatus('Screenshot feilet: ' + err.message, '#e74c3c');
+			callback(null);
+		});
+	}
+
+	// ===================== HENT FRA SERVER =====================
+	function hentFraServer() {
+		setStatus('Spør server...');
+		serverHent((svar) => {
+			if (!svar) { setStatus('Ingen server-svar for denne oppgaven.', '#e74c3c'); return; }
+			setStatus('Server: ' + svar, '#27ae60');
+			const result = document.getElementById('ai-result');
+			if (result) { result.textContent = svar; result.style.display = 'block'; }
+			if (document.getElementById('ai-auto-submit')?.checked)
+				submitSvar(svar, (riktig) => { if (!riktig) setStatus('Server-svar var feil.', '#e74c3c'); });
+		});
+	}
+
+	// ===================== HENT OG LØS =====================
+	function hentOgLos() {
+		if (isRunning) return;
+		isRunning = true;
+		forsokSvar = [];
+		const result = document.getElementById('ai-result');
+		setStatus('Spør server...');
+		serverHent((serversvar) => {
+			if (serversvar) {
+				setStatus('Server/cache: ' + serversvar, '#27ae60');
+				if (result) { result.textContent = serversvar; result.style.display = 'block'; }
+				forsokSvar.push(serversvar);
+				if (!document.getElementById('ai-auto-submit')?.checked) { isRunning = false; return; }
+				submitSvar(serversvar, (riktig) => { if (riktig) { isRunning = false; } else fortsettMedTekst(result); });
+				return;
+			}
+			fortsettMedTekst(result);
+		});
+	}
+
+	function fortsettMedTekst(result) {
+		setStatus('Løser med tekst...');
+		losMedTekst((svar) => {
+			if (!svar) { isRunning = false; return; }
+			if (result) { result.textContent = svar; result.style.display = 'block'; }
+			forsokSvar.push(svar);
+			if (!document.getElementById('ai-auto-submit')?.checked) { isRunning = false; return; }
+			submitSvar(svar, (riktig) => {
+				if (riktig) { isRunning = false; return; }
+				setStatus('Tekst feil – screenshot...');
+				losMedScreenshot(forsokSvar, (svar2) => {
+					if (!svar2) { isRunning = false; return; }
+					if (result) { result.textContent = svar2; result.style.display = 'block'; }
+					forsokSvar.push(svar2);
+					submitSvar(svar2, () => { isRunning = false; });
+				});
+			});
+		});
+	}
+
+	// ===================== AUTO-MODUS =====================
+	function losOppgave(forsok) {
+		if (!autoMode) { isRunning = false; return; }
+		if (forsok === 0) { isRunning = true; forsokSvar = []; }
+		const result = document.getElementById('ai-result');
+
+		if (forsok === 0) {
+			setStatus('Spør server/cache...');
+			serverHent((serversvar) => {
+				if (!autoMode) { isRunning = false; return; }
+				if (serversvar && !forsokSvar.includes(serversvar)) {
+					if (result) { result.textContent = serversvar; result.style.display = 'block'; }
+					forsokSvar.push(serversvar);
+					submitSvar(serversvar, (riktig) => { if (riktig) etterRiktig(); else losOppgave(1); });
+					return;
+				}
+				setStatus('Løser med tekst...');
+				losMedTekst((svar) => {
+					if (!svar || !autoMode) { isRunning = false; return; }
+					if (result) { result.textContent = svar; result.style.display = 'block'; }
+					forsokSvar.push(svar);
+					submitSvar(svar, (riktig) => { if (riktig) etterRiktig(); else losOppgave(1); });
+				});
+			});
+		} else if (forsok <= 4) {
+			setStatus(`Screenshot-forsøk ${forsok}...`);
+			losMedScreenshot(forsokSvar, (svar) => {
+				if (!svar || !autoMode) { isRunning = false; return; }
+				if (forsokSvar.includes(svar)) { hopperOver(); return; }
+				if (result) { result.textContent = svar; result.style.display = 'block'; }
+				forsokSvar.push(svar);
+				submitSvar(svar, (riktig) => {
+					if (riktig) etterRiktig();
+					else if (forsok < 4) losOppgave(forsok + 1);
+					else hopperOver();
+				});
+			});
+		} else { hopperOver(); }
+	}
+
+	function hopperOver() {
+		if (!autoMode) { isRunning = false; return; }
+		setStatus(`Ga opp. Prøvd: ${forsokSvar.join(', ')}`, '#e74c3c');
+		startCountdown(delaySeconds, () => {
+			if (!autoMode) { isRunning = false; return; }
+			if (!gaTilNeste()) {
+				if (gaTilSisteEtappe()) setTimeout(() => losOppgave(0), 2500);
+				else { setStatus('Ferdig / fant ikke neste.'); autoMode = false; isRunning = false; oppdaterAutoBtn(); }
+			} else setTimeout(() => losOppgave(0), 2000);
+		});
+	}
+
+	function etterRiktig() {
+		if (!autoMode) { isRunning = false; return; }
+		startCountdown(delaySeconds, () => {
+			if (!autoMode) { isRunning = false; return; }
+			if (!gaTilNeste()) {
+				if (gaTilSisteEtappe()) setTimeout(() => losOppgave(0), 2500);
+				else { setStatus('Ferdig!', '#27ae60'); autoMode = false; isRunning = false; oppdaterAutoBtn(); }
+			} else setTimeout(() => losOppgave(0), 2000);
+		});
+	}
+
+	function oppdaterAutoBtn() {
+		const btn = document.getElementById('ai-auto-btn');
+		if (!btn) return;
+		btn.textContent = autoMode ? '⏹ Stopp auto' : '▶ Start auto-modus';
+		btn.style.background = autoMode ? '#c0392b' : '#e67e22';
+	}
+
+	// ===================== UI =====================
+	const panel = document.createElement('div');
+	panel.id = 'ai-solver-panel';
+	panel.style.cssText = `
+		position: fixed; bottom: 20px; right: 20px; width: 320px;
+		background: #fff; border: 1px solid #ddd; border-radius: 12px;
+		box-shadow: 0 6px 24px rgba(0,0,0,0.13); font-family: sans-serif;
+		font-size: 14px; z-index: 99999; overflow: hidden;
+	`;
+
+	panel.innerHTML = `
+		<div id="ai-header" style="background:#2c3e50;color:white;padding:10px 14px;font-weight:bold;
+			cursor:pointer;display:flex;justify-content:space-between;align-items:center;">
+			<span>Kikora AI Solver</span>
+			<span id="ai-toggle" style="font-size:18px;">−</span>
+		</div>
+		<div id="ai-body" style="padding:12px;">
+			<button id="ai-auto-btn" style="width:100%;padding:9px;background:#e67e22;color:white;
+				border:none;border-radius:7px;cursor:pointer;margin-bottom:8px;font-size:13px;font-weight:bold;">
+				▶ Start auto-modus
+			</button>
+			<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+				<label style="font-size:12px;color:#666;white-space:nowrap;">Delay:</label>
+				<input id="ai-delay" type="number" min="1" max="60" value="5"
+					style="width:52px;padding:4px 6px;font-size:13px;border:1px solid #ccc;border-radius:5px;">
+				<span style="font-size:11px;color:#aaa;">sek mellom oppgaver</span>
+			</div>
+			<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+				<button id="ai-server-btn" style="padding:7px;background:#16a085;color:white;
+					border:none;border-radius:6px;cursor:pointer;font-size:12px;">🌐 Hent fra server</button>
+				<button id="ai-hent-btn" style="padding:7px;background:#8e44ad;color:white;
+					border:none;border-radius:6px;cursor:pointer;font-size:12px;">⚡ Hent og løs</button>
+			</div>
+			<button id="ai-screenshot-btn" style="width:100%;padding:8px;background:#2980b9;color:white;
+				border:none;border-radius:6px;cursor:pointer;margin-bottom:10px;font-size:13px;">
+				📷 Løs med screenshot
+			</button>
+			<div style="text-align:center;font-size:11px;color:#bbb;margin-bottom:8px;">— eller manuelt —</div>
+			<textarea id="ai-input" placeholder="Lim inn oppgaven her..." style="width:100%;height:56px;
+				resize:vertical;padding:8px;font-size:13px;border:1px solid #ccc;border-radius:6px;
+				box-sizing:border-box;margin-bottom:6px;"></textarea>
+			<button id="ai-solve-btn" style="width:100%;padding:8px;background:#27ae60;color:white;
+				border:none;border-radius:6px;cursor:pointer;font-size:13px;margin-bottom:10px;">
+				✏️ Løs tekst
+			</button>
+			<label style="font-size:12px;color:#555;display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:6px;">
+				<input type="checkbox" id="ai-auto-submit" checked> Auto-submit svar
+			</label>
+			<button id="ai-reset-key" style="width:100%;padding:5px;background:none;border:1px solid #eee;
+				border-radius:5px;cursor:pointer;font-size:11px;color:#bbb;margin-bottom:6px;">Bytt API-nøkkel</button>
+			<div id="ai-status" style="font-size:12px;color:#888;min-height:16px;word-break:break-word;"></div>
+			<div id="ai-result" style="margin-top:8px;background:#f5f7fa;border-radius:7px;padding:10px;
+				font-size:15px;font-weight:bold;color:#2c3e50;white-space:pre-wrap;
+				max-height:180px;overflow-y:auto;display:none;text-align:center;"></div>
+		</div>
+	`;
+
+	document.body.appendChild(panel);
+
+	let collapsed = false;
+	document.getElementById('ai-header').addEventListener('click', () => {
+		collapsed = !collapsed;
+		document.getElementById('ai-body').style.display = collapsed ? 'none' : 'block';
+		document.getElementById('ai-toggle').textContent = collapsed ? '+' : '−';
+	});
+	document.getElementById('ai-delay').addEventListener('change', e => { delaySeconds = Math.max(1, parseInt(e.target.value) || 5); });
+	document.getElementById('ai-auto-btn').addEventListener('click', () => {
+		if (isRunning && !autoMode) return;
+		autoMode = !autoMode;
+		oppdaterAutoBtn();
+		if (autoMode) { delaySeconds = Math.max(1, parseInt(document.getElementById('ai-delay').value) || 5); losOppgave(0); }
+		else { clearInterval(countdownInterval); isRunning = false; setStatus('Stoppet.'); }
+	});
+	document.getElementById('ai-server-btn').addEventListener('click', hentFraServer);
+	document.getElementById('ai-hent-btn').addEventListener('click', hentOgLos);
+	document.getElementById('ai-screenshot-btn').addEventListener('click', () => {
+		if (isRunning) return;
+		isRunning = true; forsokSvar = [];
+		losMedScreenshot([], (svar) => {
+			isRunning = false;
+			if (!svar) return;
+			const result = document.getElementById('ai-result');
+			if (result) { result.textContent = svar; result.style.display = 'block'; }
+			forsokSvar.push(svar);
+			if (document.getElementById('ai-auto-submit')?.checked) submitSvar(svar, () => {});
+		});
+	});
+	document.getElementById('ai-solve-btn').addEventListener('click', () => {
+		const oppgave = document.getElementById('ai-input')?.value.trim();
+		if (!oppgave) return;
+		setStatus('Tenker...');
+		kallGroq([
+			{ role: 'system', content: PROMPT_TEKST },
+			{ role: 'user', content: 'Svar bare med svaret.\n\n' + oppgave },
+		], (svar) => {
+			if (!svar) return;
+			const result = document.getElementById('ai-result');
+			if (result) { result.textContent = svar; result.style.display = 'block'; }
+			if (document.getElementById('ai-auto-submit')?.checked) submitSvar(svar, () => {});
+		});
+	});
+	document.getElementById('ai-reset-key').addEventListener('click', () => {
+		const ny = prompt('Ny Groq API-nøkkel:');
+		if (ny) { API_KEY = ny.trim(); GM_setValue('groq_api_key', API_KEY); setStatus('Nøkkel oppdatert.', '#27ae60'); }
+	});
+
+	console.log('[Kikora Solver] v9.2 klar. Oppgave-ID:', getOppgaveId());
+})();
